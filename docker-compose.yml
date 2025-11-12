@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: locallift_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: locallift
+      POSTGRES_USER: locallift
+      POSTGRES_PASSWORD: locallift_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: locallift_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+volumes:
+  pg_data:
+    driver: local
