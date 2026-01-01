@@ -25,6 +25,9 @@ async def enrich_property_contact(
 ) -> ContactEnrichment:
     """Enrich contact information for a single property.
     
+    IMPORTANT: Only saves emails that have been VERIFIED as deliverable.
+    This prevents bounces from invalid email addresses.
+    
     Returns:
         ContactEnrichment record (created or updated)
     """
@@ -32,11 +35,11 @@ async def enrich_property_contact(
         # Check if enrichment already exists
         existing = await session.get(ContactEnrichment, property.prop_id)
         
-        # Skip if already successfully enriched
-        if existing and existing.enrichment_status == "success":
+        # Skip if already successfully enriched AND verified
+        if existing and existing.enrichment_status == "success" and existing.email_verified:
             return existing
         
-        # Attempt enrichment
+        # Attempt enrichment with verification
         hunter_response = await hunter_client.enrich_contact(
             owner_name=property.owner_name,
             owner_address=property.owner_address,
@@ -52,21 +55,56 @@ async def enrich_property_contact(
             "updated_at": datetime.utcnow(),
         }
         
-        if hunter_response:
+        if hunter_response and hunter_response.email:
+            # Email was found AND verified (enrich_contact now only returns verified emails)
             enrichment_data.update({
                 "email": hunter_response.email,
                 "phone": hunter_response.phone,
                 "hunter_confidence_score": hunter_response.confidence_score,
                 "hunter_sources_count": hunter_response.sources_count,
                 "hunter_verification_status": hunter_response.verification_status,
+                "email_verified": True,
+                "email_deliverable": True,
+                "email_verification_score": hunter_response.confidence_score,
                 "enrichment_status": "success",
                 "last_error": None,
             })
-        else:
+            _logger.info(
+                "Contact enriched with VERIFIED email",
+                prop_id=property.prop_id,
+                email=hunter_response.email,
+                verification_status=hunter_response.verification_status,
+                confidence_score=hunter_response.confidence_score,
+            )
+        elif hunter_response and hunter_response.phone and not hunter_response.email:
+            # Only phone found, no verified email
             enrichment_data.update({
+                "email": None,  # Explicitly set to None - no unverified emails
+                "phone": hunter_response.phone,
+                "email_verified": False,
+                "email_deliverable": False,
+                "enrichment_status": "partial",  # Phone only
+                "last_error": None,
+            })
+            _logger.info(
+                "Contact enriched with phone only (no verified email)",
+                prop_id=property.prop_id,
+                phone=hunter_response.phone,
+            )
+        else:
+            # No verified contact info found
+            enrichment_data.update({
+                "email": None,
+                "phone": None,
+                "email_verified": False,
+                "email_deliverable": False,
                 "enrichment_status": "not_found",
                 "last_error": None,
             })
+            _logger.debug(
+                "No verified contact info found",
+                prop_id=property.prop_id,
+            )
         
         # Upsert enrichment record
         stmt = insert(ContactEnrichment).values(**enrichment_data)
@@ -78,6 +116,9 @@ async def enrich_property_contact(
                 "hunter_confidence_score": stmt.excluded.hunter_confidence_score,
                 "hunter_sources_count": stmt.excluded.hunter_sources_count,
                 "hunter_verification_status": stmt.excluded.hunter_verification_status,
+                "email_verified": stmt.excluded.email_verified,
+                "email_deliverable": stmt.excluded.email_deliverable,
+                "email_verification_score": stmt.excluded.email_verification_score,
                 "enriched_at": stmt.excluded.enriched_at,
                 "enrichment_status": stmt.excluded.enrichment_status,
                 "last_error": stmt.excluded.last_error,
@@ -98,6 +139,8 @@ async def enrich_property_contact(
             "owner_name": property.owner_name,
             "owner_address": property.owner_address,
             "enrichment_status": "failed",
+            "email_verified": False,
+            "email_deliverable": False,
             "last_error": str(e)[:500],
             "updated_at": datetime.utcnow(),
         }
@@ -107,6 +150,8 @@ async def enrich_property_contact(
             index_elements=["prop_id"],
             set_={
                 "enrichment_status": stmt.excluded.enrichment_status,
+                "email_verified": stmt.excluded.email_verified,
+                "email_deliverable": stmt.excluded.email_deliverable,
                 "last_error": stmt.excluded.last_error,
                 "retry_count": ContactEnrichment.retry_count + 1,
                 "updated_at": stmt.excluded.updated_at,
@@ -118,13 +163,100 @@ async def enrich_property_contact(
         raise
 
 
+async def verify_existing_emails(
+    session: AsyncSession,
+    hunter_client: HunterIOClient,
+    batch_size: int = 50,
+) -> dict[str, int]:
+    """Verify all existing unverified emails in the database.
+    
+    This should be run to clean up any emails that were added before
+    verification was implemented.
+    
+    Returns:
+        Dictionary with verification statistics
+    """
+    stats = {
+        "total": 0,
+        "verified_valid": 0,
+        "verified_invalid": 0,
+        "failed": 0,
+    }
+    
+    # Query contacts with emails that haven't been verified
+    query = select(ContactEnrichment).where(
+        ContactEnrichment.email.isnot(None),
+        ContactEnrichment.email != "",
+        ContactEnrichment.email_verified == False,
+    ).order_by(ContactEnrichment.prop_id)
+    
+    result = await session.execute(query)
+    contacts = list(result.scalars().all())
+    
+    stats["total"] = len(contacts)
+    _logger.info("Starting verification of existing emails", total=len(contacts))
+    
+    for contact in contacts:
+        try:
+            verification = await hunter_client.verify_email(contact.email)
+            
+            if verification.get("deliverable", False):
+                # Email is valid - update record
+                contact.email_verified = True
+                contact.email_deliverable = True
+                contact.email_verification_score = verification.get("score")
+                contact.hunter_verification_status = verification.get("status")
+                contact.email_mx_records = verification.get("mx_records", False)
+                contact.email_smtp_check = verification.get("smtp_check", False)
+                contact.email_is_disposable = verification.get("disposable", False)
+                contact.email_is_webmail = verification.get("webmail", False)
+                contact.email_verification_reason = verification.get("reason")
+                stats["verified_valid"] += 1
+                _logger.info(
+                    "Email verified as VALID",
+                    email=contact.email,
+                    score=verification.get("score"),
+                )
+            else:
+                # Email is invalid - REMOVE IT to prevent bounces
+                _logger.warning(
+                    "Email verified as INVALID - removing from record",
+                    email=contact.email,
+                    status=verification.get("status"),
+                    reason=verification.get("reason"),
+                )
+                contact.email = None  # Remove invalid email
+                contact.email_verified = False
+                contact.email_deliverable = False
+                contact.email_verification_score = verification.get("score")
+                contact.hunter_verification_status = verification.get("status")
+                contact.email_verification_reason = verification.get("reason")
+                contact.enrichment_status = "unverified"  # Mark as unverified
+                stats["verified_invalid"] += 1
+            
+            contact.updated_at = datetime.utcnow()
+            await session.commit()
+            
+            # Rate limiting
+            await asyncio.sleep(1.2)  # ~50 requests per minute
+            
+        except Exception as e:
+            _logger.exception("Error verifying email", email=contact.email, error=str(e))
+            stats["failed"] += 1
+    
+    _logger.success("Email verification completed", **stats)
+    return stats
+
+
 async def enrich_properties_batch(
     session: AsyncSession,
     hunter_client: HunterIOClient,
     properties: list[Property],
-    rate_limit_per_minute: int = 50,
+    rate_limit_per_minute: int = 25,  # Reduced because we now make 2 API calls per contact
 ) -> dict[str, int]:
     """Enrich a batch of properties with rate limiting.
+    
+    Note: Rate limit is lower because each enrichment now includes verification.
     
     Returns:
         Dictionary with enrichment statistics
@@ -132,27 +264,30 @@ async def enrich_properties_batch(
     stats = {
         "total": len(properties),
         "success": 0,
+        "partial": 0,  # Phone only
         "not_found": 0,
         "failed": 0,
         "skipped": 0,
     }
     
-    # Rate limiting: delay between requests
+    # Rate limiting: delay between requests (doubled because we verify each email)
     delay_seconds = 60.0 / rate_limit_per_minute
     
     for i, property in enumerate(properties):
         try:
-            # Check if already enriched
+            # Check if already enriched with verified email
             existing = await session.get(ContactEnrichment, property.prop_id)
-            if existing and existing.enrichment_status == "success":
+            if existing and existing.enrichment_status == "success" and existing.email_verified:
                 stats["skipped"] += 1
                 continue
             
-            # Enrich contact
+            # Enrich contact (now includes verification)
             enrichment = await enrich_property_contact(session, hunter_client, property)
             
             if enrichment.enrichment_status == "success":
                 stats["success"] += 1
+            elif enrichment.enrichment_status == "partial":
+                stats["partial"] += 1
             elif enrichment.enrichment_status == "not_found":
                 stats["not_found"] += 1
             else:
@@ -173,9 +308,12 @@ async def enrich_all_properties(
     session: AsyncSession,
     batch_size: int = 100,
     limit: int | None = None,
-    min_confidence: int = 0,
+    min_confidence: int = 70,  # Minimum confidence score
 ) -> dict[str, int]:
     """Enrich all properties that need contact enrichment.
+    
+    IMPORTANT: This now verifies all emails before saving them.
+    Only verified, deliverable emails will be stored.
     
     Args:
         batch_size: Number of properties to process per batch
@@ -201,17 +339,21 @@ async def enrich_all_properties(
     result = await session.execute(query)
     properties = list(result.scalars().all())
     
-    _logger.info("Starting contact enrichment", total_properties=len(properties))
+    _logger.info("Starting contact enrichment WITH VERIFICATION", total_properties=len(properties))
     
     overall_stats = {
         "total": len(properties),
         "success": 0,
+        "partial": 0,
         "not_found": 0,
         "failed": 0,
         "skipped": 0,
     }
     
     async with HunterIOClient(_settings.hunter_io_api_key) as hunter_client:
+        # Set minimum confidence score
+        hunter_client.MIN_CONFIDENCE_SCORE = min_confidence
+        
         # Process in batches
         for i in range(0, len(properties), batch_size):
             batch = properties[i:i + batch_size]
@@ -219,12 +361,13 @@ async def enrich_all_properties(
                 session,
                 hunter_client,
                 batch,
-                rate_limit_per_minute=_settings.hunter_io_rate_limit_per_minute,
+                rate_limit_per_minute=_settings.hunter_io_rate_limit_per_minute // 2,  # Halved for verification
             )
             
             # Accumulate stats
             for key in overall_stats:
-                overall_stats[key] += batch_stats.get(key, 0)
+                if key in batch_stats:
+                    overall_stats[key] += batch_stats.get(key, 0)
             
             _logger.info(
                 "Enrichment batch progress",
@@ -234,6 +377,37 @@ async def enrich_all_properties(
                 overall_stats=overall_stats,
             )
     
-    _logger.success("Contact enrichment completed", **overall_stats)
+    _logger.success("Contact enrichment with verification completed", **overall_stats)
     return overall_stats
 
+
+async def get_verified_contacts_for_outreach(
+    session: AsyncSession,
+    limit: int | None = None,
+) -> list[ContactEnrichment]:
+    """Get only verified, deliverable contacts for email outreach.
+    
+    This is the ONLY function that should be used to get contacts for sending emails.
+    It ensures we only send to verified addresses.
+    
+    Args:
+        limit: Maximum number of contacts to return
+        
+    Returns:
+        List of ContactEnrichment records with verified emails
+    """
+    query = select(ContactEnrichment).where(
+        ContactEnrichment.email.isnot(None),
+        ContactEnrichment.email != "",
+        ContactEnrichment.email_verified == True,
+        ContactEnrichment.email_deliverable == True,
+    ).order_by(ContactEnrichment.enriched_at.desc())
+    
+    if limit:
+        query = query.limit(limit)
+    
+    result = await session.execute(query)
+    contacts = list(result.scalars().all())
+    
+    _logger.info("Retrieved verified contacts for outreach", count=len(contacts))
+    return contacts

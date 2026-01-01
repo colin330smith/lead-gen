@@ -15,9 +15,15 @@ _settings = get_settings()
 
 
 class HunterIOClient:
-    """Client for Hunter.io API for contact enrichment."""
+    """Client for Hunter.io API for contact enrichment with email verification."""
     
     BASE_URL = "https://api.hunter.io/v2"
+    
+    # Verification statuses that indicate a valid, deliverable email
+    VALID_VERIFICATION_STATUSES = {"valid", "accept_all"}
+    
+    # Minimum confidence score to accept an email (0-100)
+    MIN_CONFIDENCE_SCORE = 70
     
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or getattr(_settings, "hunter_io_api_key", None)
@@ -34,6 +40,89 @@ class HunterIOClient:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.client.aclose()
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        reraise=True,
+    )
+    async def verify_email(self, email: str) -> dict[str, Any]:
+        """Verify an email address using Hunter.io Email Verifier API.
+        
+        This MUST be called before sending any email to prevent bounces.
+        
+        Args:
+            email: Email address to verify
+            
+        Returns:
+            Dictionary with verification results:
+            - status: 'valid', 'invalid', 'accept_all', 'webmail', 'disposable', 'unknown'
+            - score: Confidence score 0-100
+            - deliverable: Boolean indicating if email is safe to send to
+            - reason: Reason for the status
+        """
+        params = {
+            "api_key": self.api_key,
+            "email": email,
+        }
+        
+        try:
+            response = await self.client.get("/email-verifier", params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            result = data.get("data", {})
+            
+            # Determine if email is deliverable based on status and score
+            status = result.get("status", "unknown")
+            score = result.get("score", 0)
+            
+            # Email is deliverable if:
+            # 1. Status is 'valid' or 'accept_all' (catch-all domains)
+            # 2. Score is above minimum threshold
+            deliverable = (
+                status in self.VALID_VERIFICATION_STATUSES and
+                score >= self.MIN_CONFIDENCE_SCORE
+            )
+            
+            verification_result = {
+                "status": status,
+                "score": score,
+                "deliverable": deliverable,
+                "reason": result.get("result", "unknown"),
+                "mx_records": result.get("mx_records", False),
+                "smtp_server": result.get("smtp_server", False),
+                "smtp_check": result.get("smtp_check", False),
+                "accept_all": result.get("accept_all", False),
+                "block": result.get("block", False),
+                "disposable": result.get("disposable", False),
+                "webmail": result.get("webmail", False),
+            }
+            
+            _logger.info(
+                "Email verification result",
+                email=email,
+                status=status,
+                score=score,
+                deliverable=deliverable,
+            )
+            
+            return verification_result
+        
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                _logger.warning("Hunter.io rate limit exceeded during verification")
+                raise
+            else:
+                _logger.error(
+                    "Hunter.io verification API error",
+                    status_code=e.response.status_code,
+                    response=e.response.text,
+                )
+                raise
+        except Exception as e:
+            _logger.exception("Error verifying email via Hunter.io", email=email, error=str(e))
+            raise
     
     @retry(
         stop=stop_after_attempt(3),
@@ -155,6 +244,65 @@ class HunterIOClient:
             _logger.exception("Error calling Hunter.io API", error=str(e))
             raise
     
+    async def find_and_verify_email(
+        self,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        domain: str | None = None,
+        company: str | None = None,
+    ) -> HunterIOResponse | None:
+        """Find AND verify an email address before returning it.
+        
+        This is the recommended method to use - it ensures we only return
+        emails that have been verified as deliverable.
+        
+        Args:
+            first_name: First name of the person
+            last_name: Last name of the person
+            domain: Domain name (e.g., 'example.com')
+            company: Company name
+            
+        Returns:
+            HunterIOResponse with verified email, or None if not found/invalid
+        """
+        # First, find the email
+        email_response = await self.find_email(
+            first_name=first_name,
+            last_name=last_name,
+            domain=domain,
+            company=company,
+        )
+        
+        if not email_response or not email_response.email:
+            _logger.debug("No email found", first_name=first_name, last_name=last_name, domain=domain)
+            return None
+        
+        # Now verify the email
+        verification = await self.verify_email(email_response.email)
+        
+        if not verification.get("deliverable", False):
+            _logger.warning(
+                "Email found but failed verification - NOT returning",
+                email=email_response.email,
+                verification_status=verification.get("status"),
+                verification_score=verification.get("score"),
+                reason=verification.get("reason"),
+            )
+            return None
+        
+        # Update the response with verification data
+        email_response.verification_status = verification.get("status")
+        email_response.confidence_score = verification.get("score")
+        
+        _logger.info(
+            "Email found and verified successfully",
+            email=email_response.email,
+            verification_status=verification.get("status"),
+            verification_score=verification.get("score"),
+        )
+        
+        return email_response
+    
     async def enrich_contact(
         self,
         owner_name: str | None = None,
@@ -163,7 +311,8 @@ class HunterIOClient:
     ) -> HunterIOResponse | None:
         """Enrich contact information for a property owner.
         
-        Attempts to find email and phone using available information.
+        Attempts to find AND VERIFY email using available information.
+        Only returns emails that have been verified as deliverable.
         
         Args:
             owner_name: Full name or owner name from property record
@@ -171,7 +320,7 @@ class HunterIOClient:
             domain_hint: Optional domain hint (e.g., from email in address)
             
         Returns:
-            HunterIOResponse with enriched contact data, or None
+            HunterIOResponse with enriched and VERIFIED contact data, or None
         """
         # Parse name
         first_name = None
@@ -193,27 +342,27 @@ class HunterIOClient:
             if matches:
                 domain = matches[0].split("@")[1]
         
-        # Try email finder first
+        # Use find_and_verify_email instead of just find_email
         email_response = None
         if (first_name or last_name) and domain:
-            email_response = await self.find_email(
+            email_response = await self.find_and_verify_email(
                 first_name=first_name,
                 last_name=last_name,
                 domain=domain,
             )
         
-        # Try phone finder if we have email
+        # Try phone finder if we have verified email
         phone = None
         if email_response and email_response.email:
             phone = await self.find_phone(email=email_response.email)
         
-        # If we got email, return combined response
+        # If we got verified email, return combined response
         if email_response:
             if phone:
                 email_response.phone = phone
             return email_response
         
-        # If no email but we have name, try phone finder directly
+        # If no verified email but we have name, try phone finder directly
         if (first_name or last_name) and domain:
             phone = await self.find_phone(
                 first_name=first_name,
@@ -224,4 +373,3 @@ class HunterIOClient:
                 return HunterIOResponse(phone=phone)
         
         return None
-
